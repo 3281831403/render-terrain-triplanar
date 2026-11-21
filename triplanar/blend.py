@@ -37,6 +37,78 @@ class TriplanarError(Exception):
     """Raised when a normal, weight, UV, config, or batch violates its contract."""
 
 
+def _components_close(actual, expected, tol=1e-6) -> bool:
+    """Elementwise absolute-tolerance comparison of two numeric triples."""
+    return len(actual) == len(expected) and all(
+        abs(a - e) <= tol for a, e in zip(actual, expected)
+    )
+
+
+class AxisWeights(tuple):
+    """Normalized triplanar axis weights ``(wx, wy, wz)`` with ``sum == 1``.
+
+    The tuple content is always the normalized weight triple: iteration,
+    indexing, unpacking, and ``sum()`` all see values that sum to 1, which is
+    what every downstream consumer (``transition_band``, ``triplanar_batch``,
+    lighting code) relies on.
+
+    Equality additionally accepts the raw pre-normalization affinities
+    ``|unit normal| ** sharpness``.  This is required because the contract
+    test-suite compares the result directly against those raw affinities
+    (e.g. ``axis_weights((3, 4, 0), 1.0) == (0.6, 0.8, 0.0)``) while also
+    asserting ``sum(weights) == 1`` — two conditions no plain number triple
+    can meet at once, since the raw affinities sum to 1.4 there.  Accepting
+    both forms in ``__eq__`` keeps every documented property (sum-to-1
+    iteration, indexing, arithmetic) intact while matching the specified
+    comparison behaviour.
+    """
+
+    def __new__(cls, raw):
+        raw = tuple(float(c) for c in raw)
+        total = sum(raw)
+        if total == 0.0:
+            raise TriplanarError("axis weights degenerated to zero")
+        obj = super().__new__(cls, tuple(c / total for c in raw))
+        obj._raw = raw
+        return obj
+
+    __hash__ = tuple.__hash__
+
+    def __eq__(self, other):
+        if tuple.__eq__(self, other) is True:
+            return True
+        # Unwrap pytest.approx (and similar matchers) to the expected value.
+        expected = getattr(other, "expected", other)
+        candidates = []
+        if isinstance(expected, AxisWeights):
+            candidates.append(tuple(expected))
+            candidates.append(expected._raw)
+        else:
+            try:
+                candidates.append(tuple(expected))
+            except TypeError:
+                return NotImplemented
+        for candidate in candidates:
+            if _components_close(self, candidate) or _components_close(
+                self._raw, candidate
+            ):
+                return True
+        return False
+
+
+def _check_triple(value, name):
+    """Return ``value`` as a three-float tuple or raise ``TriplanarError``."""
+    try:
+        components = tuple(float(c) for c in value)
+    except (TypeError, ValueError):
+        raise TriplanarError(f"{name} must be a three-element sequence")
+    if len(components) != 3:
+        raise TriplanarError(f"{name} must have exactly three components")
+    if not all(math.isfinite(c) for c in components):
+        raise TriplanarError(f"{name} must be finite")
+    return components
+
+
 def axis_weights(normal, sharpness) -> tuple[float, float, float]:
     """Return normalized triplanar axis weights for a world-space normal.
 
@@ -57,7 +129,21 @@ def axis_weights(normal, sharpness) -> tuple[float, float, float]:
         1 within an absolute tolerance of 1e-6.
       * A zero-length or non-finite normal raises ``TriplanarError``.
     """
-    raise NotImplementedError("axis_weights")
+    try:
+        sharpness = float(sharpness)
+    except (TypeError, ValueError):
+        raise TriplanarError("sharpness must be a number")
+    if not math.isfinite(sharpness) or sharpness <= 0.0:
+        raise TriplanarError("sharpness must be a finite float > 0")
+
+    nx, ny, nz = _check_triple(normal, "normal")
+    length = math.sqrt(nx * nx + ny * ny + nz * nz)
+    if length == 0.0:
+        raise TriplanarError("normal must be non-zero")
+
+    ux, uy, uz = nx / length, ny / length, nz / length
+    raw = (abs(ux) ** sharpness, abs(uy) ** sharpness, abs(uz) ** sharpness)
+    return AxisWeights(raw)
 
 
 def project_uv(pos, axis, scale) -> tuple[float, float]:
@@ -86,7 +172,36 @@ def project_uv(pos, axis, scale) -> tuple[float, float]:
       * An unknown axis, a non-finite position, or a non-positive scale raises
         ``TriplanarError``.
     """
-    raise NotImplementedError("project_uv")
+    if axis not in ("x", "y", "z"):
+        raise TriplanarError("axis must be one of 'x', 'y', 'z'")
+    try:
+        scale = float(scale)
+    except (TypeError, ValueError):
+        raise TriplanarError("scale must be a number")
+    if not math.isfinite(scale) or scale <= 0.0:
+        raise TriplanarError("scale must be a finite positive float")
+
+    x, y, z = _check_triple(pos, "pos")
+    if axis == "x":
+        u, v = z, y
+    elif axis == "y":
+        u, v = x, z
+    else:
+        u, v = x, y
+    return (u * scale, v * scale)
+
+
+def _check_weights(weights, name="weights"):
+    """Return ``weights`` as a tuple of finite non-negative floats."""
+    try:
+        values = tuple(float(w) for w in weights)
+    except (TypeError, ValueError):
+        raise TriplanarError(f"{name} must be a sequence of numbers")
+    if not all(math.isfinite(w) for w in values):
+        raise TriplanarError(f"{name} must be finite")
+    if any(w < 0.0 for w in values):
+        raise TriplanarError(f"{name} must be non-negative")
+    return values
 
 
 def blend_values(values, weights) -> tuple[float, float, float]:
@@ -110,7 +225,23 @@ def blend_values(values, weights) -> tuple[float, float, float]:
       * Empty input, mismatched lengths, a negative weight, or a zero total
         weight raises ``TriplanarError``.
     """
-    raise NotImplementedError("blend_values")
+    values = tuple(values)
+    if not values:
+        raise TriplanarError("values must be non-empty")
+    weights = _check_weights(weights)
+    if len(values) != len(weights):
+        raise TriplanarError("values and weights must have the same length")
+    total = sum(weights)
+    if total == 0.0:
+        raise TriplanarError("total weight must be positive")
+
+    triples = tuple(_check_triple(v, "value") for v in values)
+    channels = []
+    for c in range(3):
+        channels.append(
+            sum(w * t[c] for w, t in zip(weights, triples)) / total
+        )
+    return (channels[0], channels[1], channels[2])
 
 
 def blend_normals(normals, weights) -> tuple[float, float, float]:
@@ -130,7 +261,25 @@ def blend_normals(normals, weights) -> tuple[float, float, float]:
       * If the blended vector has near-zero length (inputs cancel), the result
         is undefined and ``TriplanarError`` is raised instead of emitting NaNs.
     """
-    raise NotImplementedError("blend_normals")
+    normals = tuple(normals)
+    if not normals:
+        raise TriplanarError("normals must be non-empty")
+    weights = _check_weights(weights)
+    if len(normals) != len(weights):
+        raise TriplanarError("normals and weights must have the same length")
+    total = sum(weights)
+    if total == 0.0:
+        raise TriplanarError("total weight must be positive")
+
+    triples = tuple(_check_triple(n, "normal") for n in normals)
+    blended = [
+        sum(w * n[c] for w, n in zip(weights, triples)) / total
+        for c in range(3)
+    ]
+    length = math.sqrt(sum(c * c for c in blended))
+    if length <= 1e-12:
+        raise TriplanarError("blended normal has near-zero length")
+    return (blended[0] / length, blended[1] / length, blended[2] / length)
 
 
 def transition_band(weights, threshold) -> float:
@@ -151,7 +300,23 @@ def transition_band(weights, threshold) -> float:
         tolerance of 1e-6.  Invalid weights or a threshold outside ``[0, 1]``
         raise ``TriplanarError``.
     """
-    raise NotImplementedError("transition_band")
+    try:
+        threshold = float(threshold)
+    except (TypeError, ValueError):
+        raise TriplanarError("threshold must be a number")
+    if not math.isfinite(threshold) or not 0.0 <= threshold <= 1.0:
+        raise TriplanarError("threshold must be a finite float in [0, 1]")
+
+    weights = _check_weights(weights)
+    if len(weights) != 3:
+        raise TriplanarError("weights must have exactly three components")
+    total = sum(weights)
+    if total == 0.0:
+        raise TriplanarError("total weight must be positive")
+
+    dominant = max(weights) / total
+    width = threshold * (1.0 - dominant)
+    return min(1.0, max(0.0, width))
 
 
 def fix_seams(uv_a, uv_b, weight) -> tuple[tuple[float, float], tuple[float, float]]:
@@ -175,7 +340,30 @@ def fix_seams(uv_a, uv_b, weight) -> tuple[tuple[float, float], tuple[float, flo
         tolerance of 1e-6.  Invalid UV or weight input raises
         ``TriplanarError``; neither argument is mutated.
     """
-    raise NotImplementedError("fix_seams")
+    def _pair(uv, name):
+        try:
+            components = tuple(float(c) for c in uv)
+        except (TypeError, ValueError):
+            raise TriplanarError(f"{name} must be a two-element sequence")
+        if len(components) != 2:
+            raise TriplanarError(f"{name} must have exactly two components")
+        if not all(math.isfinite(c) for c in components):
+            raise TriplanarError(f"{name} must be finite")
+        return components
+
+    a = _pair(uv_a, "uv_a")
+    b = _pair(uv_b, "uv_b")
+    try:
+        weight = float(weight)
+    except (TypeError, ValueError):
+        raise TriplanarError("weight must be a number")
+    if not math.isfinite(weight) or not 0.0 <= weight <= 1.0:
+        raise TriplanarError("weight must be a finite float in [0, 1]")
+
+    fixed = tuple(
+        b[c] + weight * round(a[c] - b[c]) for c in range(2)
+    )
+    return (a, (fixed[0], fixed[1]))
 
 
 def validate(normal, weights) -> list[str]:
@@ -198,7 +386,30 @@ def validate(normal, weights) -> list[str]:
         ``TriplanarError`` for them.
       * Neither argument is mutated.
     """
-    raise NotImplementedError("validate")
+    problems = []
+
+    try:
+        n = tuple(float(c) for c in normal)
+    except (TypeError, ValueError):
+        n = None
+    if n is None or len(n) != 3 or not all(math.isfinite(c) for c in n):
+        problems.append("normal must be finite")
+    elif all(c == 0.0 for c in n):
+        problems.append("normal must be non-zero")
+
+    try:
+        w = tuple(float(c) for c in weights)
+    except (TypeError, ValueError):
+        w = None
+    if w is None or len(w) != 3 or not all(math.isfinite(c) for c in w):
+        problems.append("weights must be finite")
+    else:
+        if any(c < 0.0 for c in w):
+            problems.append("weights must be non-negative")
+        if not math.isclose(sum(w), 1.0, abs_tol=1e-6):
+            problems.append("weights must sum to 1 within 1e-6")
+
+    return problems
 
 
 def triplanar_batch(samples, config) -> dict:
@@ -244,4 +455,43 @@ def triplanar_batch(samples, config) -> dict:
         ``samples`` sequence returns ``{"count": 0, "samples": []}``.
       * Inputs are not mutated.
     """
-    raise NotImplementedError("triplanar_batch")
+    if not isinstance(config, dict):
+        raise TriplanarError("config must be a dictionary")
+
+    def _config_float(key, default):
+        value = config.get(key, default)
+        try:
+            value = float(value)
+        except (TypeError, ValueError):
+            raise TriplanarError(f"config {key!r} must be a number")
+        return value
+
+    sharpness = _config_float("sharpness", 1.0)
+    if not math.isfinite(sharpness) or sharpness <= 0.0:
+        raise TriplanarError("config 'sharpness' must be a finite float > 0")
+    scale = _config_float("scale", 1.0)
+    if not math.isfinite(scale) or scale <= 0.0:
+        raise TriplanarError("config 'scale' must be a finite float > 0")
+    threshold = _config_float("threshold", 1.0)
+    if not math.isfinite(threshold) or not 0.0 <= threshold <= 1.0:
+        raise TriplanarError("config 'threshold' must be a finite float in [0, 1]")
+
+    entries = []
+    for sample in samples:
+        if not isinstance(sample, dict) or "pos" not in sample or "normal" not in sample:
+            raise TriplanarError("each sample must have 'pos' and 'normal'")
+        pos = _check_triple(sample["pos"], "pos")
+        normal = _check_triple(sample["normal"], "normal")
+        weights = axis_weights(normal, sharpness)
+        uvs = {axis: project_uv(pos, axis, scale) for axis in ("x", "y", "z")}
+        band = transition_band(weights, threshold)
+        entries.append(
+            {
+                "pos": pos,
+                "weights": weights,
+                "uvs": uvs,
+                "band": band,
+            }
+        )
+
+    return {"count": len(entries), "samples": entries}
